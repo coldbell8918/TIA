@@ -19,7 +19,8 @@ from utils import Logger, AverageMeter, accuracy, mkdir_p, savefig
 
 parser = argparse.ArgumentParser(description='Knowledge Distillation for Multi-task (SegNet)')
 parser.add_argument('--weight', default='uniform', type=str, help='multi-task weighting: uniform, gradnorm, mgda, uncert, dwa, gs, etc')
-parser.add_argument('--backbone', default='segnet', type=str, help='shared backbone')
+parser.add_argument('--backbone', default='resnet50', type=str, help='shared backbone')
+parser.add_argument('--tbackbone', default='resnet101', type=str, help='shared backbone')
 parser.add_argument('--head', default='segnet_head', type=str, help='task-specific decoder')
 parser.add_argument('--tasks', default='semantic', nargs='+', help='Task(s) to be trained')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true', help='using pretrained weight from ImageNet')
@@ -29,7 +30,7 @@ parser.add_argument('--method', default='vanilla', type=str, help='vanilla or mt
 parser.add_argument('--dataroot', default='nyuv2', type=str, help='dataset root')
 parser.add_argument('--alr', default=1e-2, type=float, help='initial learning rate')
 parser.add_argument('--out', default='./results/url', help='Directory to output the result')
-parser.add_argument('--single-dir', default='./results/stl', help='Directory to output the result')
+parser.add_argument('--single-dir', default='./results/stl_2', help='Directory to output the result')
 opt = parser.parse_args()
 
 tasks = ['semantic', 'depth', 'normal']
@@ -51,7 +52,7 @@ class adaptor(torch.nn.Module):
     def __init__(self):
         super(adaptor, self).__init__()
         self.conv1 = torch.nn.Conv2d(2048, 2048, 1, bias=False)
-        # self.conv2 = torch.nn.Conv2d(64, 64, 1, bias=False)
+        # self.conv2 = torch.nn.Conv2d(256, 64, 1, bias=False)
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.xavier_normal_(m.weight)
@@ -63,10 +64,29 @@ class adaptor(torch.nn.Module):
                 nn.init.xavier_normal_(m.weight)
 
     def forward(self, inputs):
-        # results = []
-        # results.append(self.conv1(inputs[0]))
-        # results.append(self.conv2(inputs[1]))
+
         return self.conv1(inputs)
+
+class AdaptorKD(nn.Module):
+    def __init__(self, input_channels=768, output_dim=256):
+        super(AdaptorKD, self).__init__()
+        self.compress = nn.Sequential(
+            nn.Conv2d(input_channels, 512, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(512, 256, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+        self.pool = nn.AdaptiveAvgPool2d((2, 2))  # Spatial 일부 유지
+        self.fc = nn.Sequential(
+            nn.Flatten(),               # (B, 256, 2, 2) → (B, 1024)
+            nn.Linear(1024, output_dim)
+        )
+
+    def forward(self, x):
+        x = self.compress(x)       # (B, 256, H, W)
+        x = self.pool(x)           # (B, 256, 2, 2)
+        x = self.fc(x)             # (B, output_dim)
+        return x
 
 class Weight(torch.nn.Module):
     def __init__(self, tasks):
@@ -87,8 +107,28 @@ logger = Logger(os.path.join(opt.out, '{}_{}_url_{}_{}_alr_{}_'.format(opt.backb
 logger.set_names(['Epoch', 'T.Ls', 'T. mIoU', 'T. Pix', 'T.Ld', 'T.abs', 'T.rel', 'T.Ln', 'T.Mean', 'T.Med', 'T.11', 'T.22', 'T.30',
     'V.Ls', 'V. mIoU', 'V. Pix', 'V.Ld', 'V.abs', 'V.rel', 'V.Ln', 'V.Mean', 'V.Med', 'V.11', 'V.22', 'V.30', 'ds', 'dd', 'dh'])
 
+
+def concat_task_features(mid_feats, tasks):
+    """
+    task별 feature map(dict)을 하나의 텐서로 concat
+    mid_feats: {'semantic': (B, C, H, W), ...}
+    return: (B, C_total, H, W)
+    """
+    feat_list = [mid_feats[t] for t in tasks]
+    return torch.cat(feat_list, dim=1)  # 채널 차원(C) 기준으로 concat
+
 # define model, optimiser and scheduler
 model = get_model(opt, tasks_outputs=tasks_outputs).cuda()
+teacher_model = get_model(opt, tasks_outputs=tasks_outputs,teacher=True).cuda()
+checkpoint = torch.load('/workspace/UniversalRepresentations/DensePred/results/mtl-baselines/resnet152_deeplab_head_mtl_baselines_vanilla_uniform_model_best.pth.tar')
+teacher_model.load_state_dict(checkpoint['state_dict'])
+
+for param in teacher_model.parameters():
+    param.requires_grad = False
+
+kd_adaptor_teacher = AdaptorKD(input_channels=256 * len(tasks), output_dim=256).cuda()
+kd_adaptor_student = AdaptorKD(input_channels=256 * len(tasks), output_dim=256).cuda()
+
 Weights = Weight(tasks).cuda()
 single_model = {}
 adaptors = {}
@@ -96,7 +136,7 @@ adaptors = {}
 for i, t in enumerate(tasks):
     single_model[i] = get_stl_model(opt, tasks_outputs, t).cuda()
     checkpoint = torch.load('{}/{}_{}_stl_{}_model_best.pth.tar'.format(opt.single_dir, opt.backbone, opt.head, tasks[i]))
-    single_model[i].load_state_dict(checkpoint['state_dict'], strict=False)
+    single_model[i].load_state_dict(checkpoint['state_dict'])
     adaptors[i] = adaptor().cuda()
 
 params = []
@@ -147,12 +187,16 @@ avg_cost = np.zeros([total_epoch, 24], dtype=np.float32)
 # best_performance = 100
 best_performance = -100
 isbest = False
+
 for epoch in range(total_epoch):
     index = epoch
     cost = np.zeros(24, dtype=np.float32)
     dist_loss_save = {}
+    pred_loss_save = {}
+
     for i, t in enumerate(tasks):
         dist_loss_save[i] = AverageMeter()
+        pred_loss_save[i] = AverageMeter()
 
     # apply Dynamic Weight Average
 
@@ -171,7 +215,8 @@ for epoch in range(total_epoch):
         train_depth, train_normal = train_depth.cuda(), train_normal.cuda()
         train_labels = {'semantic': train_label, 'depth': train_depth, 'normal': train_normal}
 
-        train_pred, feat_s = model(train_data, feat=True)
+        train_pred, feat_s, mid_s = model(train_data, feat=True, return_mid =True)
+        
         train_loss = get_dense_tasks_losses(train_pred, train_labels, opt.tasks)
         loss = 0
 
@@ -181,20 +226,43 @@ for epoch in range(total_epoch):
         for i, t in enumerate(tasks):
             with torch.no_grad():
                 feat_ti = single_model[i].embed(train_data)
+                
             feat_si = feat_s
-
             if isinstance(feat_ti, list):
                 feat_ti = feat_ti[-1]
+
             feat_ti = F.normalize(feat_ti, p=2, dim=1, eps=1e-12)
             feat_si = adaptors[i](feat_si)
             dist_feat = torch.tensor(0).cuda()
             
-            if feat_si.size()[2:] != feat_ti.size()[2:]:
-                feat_si = F.interpolate(feat_si, feat_ti.size()[2:] , mode='bilinear')
-            feat_si = F.normalize(feat_si, p=2, dim=1, eps=1e-12)
-            dist_feat = dist_feat + (feat_si - feat_ti.detach()).pow(2).sum(1).mean()
+            for l in range(len(feat_si)):
+                if feat_si.size()[2:] != feat_ti.size()[2:]:
+                    feat_si = F.interpolate(feat_si[l], feat_ti.size()[2:] , mode='bilinear')
+                feat_si = F.normalize(feat_si, p=2, dim=1, eps=1e-12)
+                dist_feat = dist_feat + (feat_si - feat_ti.detach()).pow(2).sum(1).mean()
             dist_loss.append(dist_feat)
             dist_loss_save[i].update(dist_loss[i].data.item(), train_data.size(0))
+        
+        student_logits = concat_task_features(mid_s, tasks)
+        student_latent = kd_adaptor_student(student_logits)
+
+        teacher_pred, feat_mt, mid_t = teacher_model(train_data, feat=True, return_mid = True)
+        teacher_logits = concat_task_features(mid_t, tasks)
+        
+        # # Logit Distillation 추가 (Logits을 Task별로 통합)
+        with torch.no_grad():
+            teacher_latent = kd_adaptor_teacher(teacher_logits)
+        
+        # ✅ Logit Distillation Loss (Feature Alignment)
+        pred_loss = torch.tensor(0.0, device="cuda")
+        feat_teacher = F.normalize(teacher_latent, p=2, dim=1, eps=1e-12)
+        feat_student = F.normalize(student_latent, p=2, dim=1, eps=1e-12)
+
+        # pred_loss = (feat_student - feat_teacher.detach()).pow(2).sum(1).mean()
+        pred_loss = 1 - F.cosine_similarity(student_logits, teacher_logits.detach(), dim=1).mean()
+        pred_loss = 3 * pred_loss
+
+        pred_loss_save[i].update(pred_loss.data.item(), train_data.size(0))
 
         # loss weights (\lambda) for distillation losses
         lambda_ = [1, 1, 2]
@@ -212,15 +280,13 @@ for epoch in range(total_epoch):
                 w[i] = 1 / (scalars[i] * torch.exp(logsigma[i])).item()
             loss_weights[task].update(w[i].data, 1)
 
-        loss = loss + dist_loss
+        loss = loss + dist_loss + pred_loss
 
         optimizer.zero_grad()
         adaptor_optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         adaptor_optimizer.step()
-
-        
 
         cost[0] = train_loss[0].item()
         cost[1] = compute_miou(train_pred['semantic'], train_label, tasks_outputs['semantic']).item()
@@ -231,8 +297,8 @@ for epoch in range(total_epoch):
         cost[7], cost[8], cost[9], cost[10], cost[11] = normal_error(train_pred['normal'], train_normal)
         avg_cost[index, :12] += cost[:12] / train_batch
         
-        bar.suffix  = '{} => ({batch}/{size}) | LossS: {loss_s:.3f} | LossD: {loss_d:.3f} | LossN: {loss_n:.3f} | Ds: {ds:.2f} | Dd: {dd:.2f}| Dn: {dn:.2f} | Ws: {ws:.2f} | Wd: {wd:.2f}| Wn: {wn:.2f}'.format(
-                'url',
+        bar.suffix  = '{} => ({batch}/{size}) | LossS: {loss_s:.3f} | LossD: {loss_d:.3f} | LossN: {loss_n:.3f} | Ds: {ds:.2f} | Dd: {dd:.2f}| Dn: {dn:.2f} | LossP: {lp:.2f}'.format(
+                'pjc',
                 batch=k + 1,
                 size=train_batch,
                 loss_s=cost[1],
@@ -241,11 +307,25 @@ for epoch in range(total_epoch):
                 ds=dist_loss_save[0].val,
                 dd=dist_loss_save[1].val,
                 dn=dist_loss_save[2].val,
-                ws=loss_weights['semantic'].avg,
-                wd=loss_weights['depth'].avg,
-                wn=loss_weights['normal'].avg,
+                lp=pred_loss_save[2].val,
                 )
         bar.next()
+
+        # bar.suffix  = '{} => ({batch}/{size}) | LossS: {loss_s:.3f} | LossD: {loss_d:.3f} | LossN: {loss_n:.3f} | Ds: {ds:.2f} | Dd: {dd:.2f}| Dn: {dn:.2f} | Ws: {ws:.2f} | Wd: {wd:.2f}| Wn: {wn:.2f}'.format(
+        #         'url',
+        #         batch=k + 1,
+        #         size=train_batch,
+        #         loss_s=cost[1],
+        #         loss_d=cost[3],
+        #         loss_n=cost[6],
+        #         ds=dist_loss_save[0].val,
+        #         dd=dist_loss_save[1].val,
+        #         dn=dist_loss_save[2].val,
+        #         ws=loss_weights['semantic'].avg,
+        #         wd=loss_weights['depth'].avg,
+        #         wn=loss_weights['normal'].avg,
+        #         )
+        # bar.next()
     bar.finish()
 
     # evaluating test data

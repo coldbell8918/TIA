@@ -49,8 +49,8 @@ tasks_outputs = {
 
 stl_performance = {}
 
-stl_performance['segnet_segnet_head'] = {
-                    'full': {'semantic': 40.5355, 'depth': 0.627602, 'normal': 24.284388},
+stl_performance['resnet152_deeplab_head'] = {
+                    'full': {'semantic': 51.5800, 'depth': 0.5982, 'normal': 23.8867},
 }
 
 class Weight(torch.nn.Module):
@@ -73,6 +73,7 @@ logger.set_names(['Epoch', 'T.Ls', 'T. mIoU', 'T. Pix', 'T.Ld', 'T.abs', 'T.rel'
 
 # define model, optimiser and scheduler
 model = get_model(opt, tasks_outputs=tasks_outputs).cuda()
+
 Weights = Weight(tasks).cuda()
 params = []
 params += model.parameters()
@@ -106,7 +107,7 @@ dataset_path = opt.dataroot
 nyuv2_train_set = NYUv2(root=dataset_path, train=True, augmentation=True, flip=True, normalize=False)
 nyuv2_test_set = NYUv2(root=dataset_path, train=False, normalize=False)
 
-batch_size = 2
+batch_size = 4
 nyuv2_train_loader = torch.utils.data.DataLoader(
     dataset=nyuv2_train_set,
     batch_size=batch_size,
@@ -119,7 +120,7 @@ nyuv2_test_loader = torch.utils.data.DataLoader(
 
 
 # define parameters
-total_epoch = 200
+total_epoch = 100
 train_batch = len(nyuv2_train_loader)
 test_batch = len(nyuv2_test_loader)
 T = opt.temp
@@ -150,7 +151,7 @@ for epoch in range(total_epoch):
     model.train()
     nyuv2_train_dataset = iter(nyuv2_train_loader)
     for k in range(train_batch):
-        train_data, train_label, train_depth, train_normal = nyuv2_train_dataset.next()
+        train_data, train_label, train_depth, train_normal = next(nyuv2_train_dataset)
         train_data, train_label = train_data.cuda(), train_label.type(torch.LongTensor).cuda()
         train_depth, train_normal = train_depth.cuda(), train_normal.cuda()
         train_labels = {'semantic': train_label, 'depth': train_depth, 'normal': train_normal}
@@ -276,7 +277,7 @@ for epoch in range(total_epoch):
     with torch.no_grad():  # operations inside don't track history
         nyuv2_test_dataset = iter(nyuv2_test_loader)
         for k in range(test_batch):
-            test_data, test_label, test_depth, test_normal = nyuv2_test_dataset.next()
+            test_data, test_label, test_depth, test_normal = next(nyuv2_test_dataset)
             test_data, test_label = test_data.cuda(),  test_label.type(torch.LongTensor).cuda()
             test_depth, test_normal = test_depth.cuda(), test_normal.cuda()
 

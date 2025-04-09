@@ -7,15 +7,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class DeepLabHead(nn.Sequential):
+class DeepLabHead(nn.Module):
     def __init__(self, in_channels, num_classes):
-        super(DeepLabHead, self).__init__(
-            ASPP(in_channels, [12, 24, 36]),
+        super(DeepLabHead, self).__init__()
+        self.aspp = ASPP(in_channels, [12, 24, 36])
+        self.conv_block = nn.Sequential(
             nn.Conv2d(256, 256, 3, padding=1, bias=False),
             nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.Conv2d(256, num_classes, 1)
+            nn.ReLU()
         )
+        self.classifier = nn.Conv2d(256, num_classes, 1)
+
+    def forward(self, x):
+        x = self.aspp(x)
+        mid_feat = self.conv_block(x)
+        out = self.classifier(mid_feat)
+        return out, mid_feat
 
 
 class ASPPConv(nn.Sequential):
